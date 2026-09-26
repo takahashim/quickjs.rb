@@ -3764,6 +3764,222 @@ end
     end
   end
 
+  describe "promise_rejection_hook=" do
+    before do
+      @vm = Quickjs::VM.new
+      @vm.eval_code(<<~JS)
+        globalThis.seen = [];
+        globalThis.hook = (type, promise, reason) => { seen.push({type, promise, reason}); };
+      JS
+      @vm.promise_rejection_hook = "hook"
+    end
+
+    after do
+      @vm.dispose!
+    end
+
+    it "passes the promise and reason as the JS values themselves" do
+      @vm.eval_code("globalThis.err = new TypeError('drift'); globalThis.p = Promise.reject(err); 0")
+
+      _(@vm.eval_code("seen.length")).must_equal 1
+      _(@vm.eval_code("seen[0].type")).must_equal "unhandledrejection"
+      _(@vm.eval_code("seen[0].promise === p && seen[0].reason === err")).must_equal true
+      _(@vm.eval_code("seen[0].reason instanceof TypeError")).must_equal true
+    end
+
+    it "is silent for a rejection handled in the same checkpoint" do
+      @vm.eval_code("void Promise.reject(new Error('x')).catch(() => {});")
+      @vm.drain_jobs!
+
+      _(@vm.eval_code("seen.length")).must_equal 0
+    end
+
+    it "reports rejectionhandled when a handler arrives after the report" do
+      @vm.eval_code("globalThis.p = Promise.reject(new Error('late')); 0")
+      @vm.eval_code("void p.catch(() => {});")
+      @vm.drain_jobs!
+
+      _(@vm.eval_code("seen.map(s => s.type)")).must_equal ["unhandledrejection", "rejectionhandled"]
+      _(@vm.eval_code("seen[1].promise === p && seen[1].reason === seen[0].reason")).must_equal true
+    end
+
+    it "does not report rejectionhandled for a handler attached while the rejection is reported" do
+      @vm.eval_code(<<~JS)
+        globalThis.hook = (type, promise) => { seen.push(type); promise.catch(() => {}); };
+      JS
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("void Promise.reject(1);")
+      @vm.drain_jobs!
+
+      _(@vm.eval_code("seen")).must_equal ["unhandledrejection"]
+    end
+
+    it "reports rejectionhandled for an earlier promise of the same batch" do
+      @vm.eval_code(<<~JS)
+        globalThis.hook = (type, promise, reason) => {
+          seen.push(type + ':' + reason);
+          if (type === 'unhandledrejection' && reason === 'b') first.catch(() => {});
+        };
+      JS
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("globalThis.first = Promise.reject('a'); void Promise.reject('b'); 0")
+
+      _(@vm.eval_code("seen")).must_equal ["unhandledrejection:a", "unhandledrejection:b", "rejectionhandled:a"]
+    end
+
+    it "keeps notifying after the hook throws" do
+      @vm.eval_code(<<~JS)
+        globalThis.hook = (type, promise, reason) => { seen.push(reason); throw new Error('hook'); };
+      JS
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
+
+      _(@vm.eval_code("seen")).must_equal ["a", "b"]
+      _(@vm.eval_code("40 + 2")).must_equal 42
+    end
+
+    it "takes the place of the Ruby block while registered" do
+      captured = []
+      @vm.on_unhandled_rejection { |err| captured << err }
+      @vm.eval_code("void Promise.reject(new RangeError('hooked'));")
+
+      _(@vm.eval_code("seen.length")).must_equal 1
+      _(captured).must_be_empty
+
+      @vm.promise_rejection_hook = nil
+      @vm.eval_code("void Promise.reject(new RangeError('blocked'));")
+
+      _(@vm.eval_code("seen.length")).must_equal 1
+      _(captured.map(&:class)).must_equal [Quickjs::RangeError]
+    end
+
+    it "resolves the name as VM#call does, keeping this" do
+      @vm.eval_code(<<~JS)
+        globalThis.host = { seen: [], onRejection(type) { this.seen.push(type); } };
+      JS
+      @vm.promise_rejection_hook = "host.onRejection"
+      @vm.eval_code("void Promise.reject(1);")
+
+      _(@vm.eval_code("host.seen")).must_equal ["unhandledrejection"]
+    end
+
+    it "holds on to the function, not the expression" do
+      @vm.eval_code("globalThis.hook = () => { throw new Error('replaced'); };")
+      @vm.eval_code("void Promise.reject(1);")
+
+      _(@vm.eval_code("seen.length")).must_equal 1
+    end
+
+    it "stops calling the hook once cleared with nil" do
+      @vm.promise_rejection_hook = nil
+      @vm.eval_code("void Promise.reject(1);")
+
+      _(@vm.eval_code("seen.length")).must_equal 0
+    end
+
+    it "hands the hook what is still pending at dispose!" do
+      vm = Quickjs::VM.new
+      reported = []
+      vm.define_function("report") { |type, message| reported << [type, message] }
+      vm.eval_code("globalThis.hook = (type, promise, reason) => report(type, reason.message);")
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("void Promise.reject(new Error('x')); void Promise.resolve().then(() => {}); 0")
+      _(reported).must_be_empty
+      vm.dispose!
+      _(reported).must_equal [["unhandledrejection", "x"]]
+    end
+
+    it "refuses a name that does not hold a function" do
+      @vm.eval_code("globalThis.notAFunction = 42")
+      _ { @vm.promise_rejection_hook = "notAFunction" }.must_raise Quickjs::RuntimeError
+      _ { @vm.promise_rejection_hook = "noSuchHook" }.must_raise Quickjs::ReferenceError
+      _ { @vm.promise_rejection_hook = 42 }.must_raise TypeError
+    end
+
+    it "survives the hook clearing itself while it runs" do
+      @vm.define_function("off") { @vm.promise_rejection_hook = nil }
+      @vm.eval_code("globalThis.hook = (t, p, r) => { off(); seen.push(r); }; 0")
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("delete globalThis.hook; void Promise.reject(1);")
+      GC.start
+      @vm.eval_code("void Promise.reject(2);")
+
+      _(@vm.eval_code("seen")).must_equal [1]
+    end
+
+    it "poisons the VM when the hook runs out of memory" do
+      vm = Quickjs::VM.new(memory_limit: 1024 * 1024 * 8)
+      vm.eval_code("globalThis.hook = () => { const a = []; for (;;) a.push(new Array(1e5).fill(0)); };")
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("void Promise.reject(1);")
+
+      _(vm.memory_poisoned?).must_equal true
+      _ { vm.promise_rejection_hook = nil }.must_raise Quickjs::RuntimeError
+    end
+
+    it "gives each call its own clock" do
+      vm = Quickjs::VM.new(timeout_msec: 100)
+      vm.eval_code(<<~JS)
+        globalThis.seen = [];
+        globalThis.hook = (type, promise, reason) => {
+          seen.push(reason);
+          if (reason === 'a') { const t = Date.now(); while (Date.now() - t < 150); }
+        };
+      JS
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
+
+      _(vm.eval_code("seen")).must_equal ["a", "b"]
+    end
+
+    it "keeps calling the Ruby block after an out-of-memory" do
+      @vm.promise_rejection_hook = nil
+      vm = Quickjs::VM.new(memory_limit: 1024 * 1024 * 8)
+      captured = []
+      vm.on_unhandled_rejection do |err|
+        captured << err
+        vm.eval_code("const a = []; for (;;) a.push(new Array(1e5).fill(0));") rescue nil
+      end
+      vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
+
+      _(captured.size).must_equal 2
+    end
+
+    it "does not show $! to bridges called for rejectionhandled" do
+      peeked = []
+      @vm.define_function("peek") { peeked << $! }
+      @vm.eval_code("globalThis.hook = (type) => { if (type === 'rejectionhandled') peek(); }; 0")
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("globalThis.q = Promise.reject(1); 0")
+      _ { @vm.eval_code("q.catch(() => {}); throw new Error('outer')") }.must_raise Quickjs::RuntimeError
+
+      _(peeked).must_equal [nil]
+    end
+
+    it "reports a rejection made by the getter it reads" do
+      @vm.eval_code(<<~JS)
+        Object.defineProperty(globalThis, 'lazyHook', {
+          get() { void Promise.reject(new Error('g')); return (type, promise, reason) => seen.push(reason.message); }
+        });
+      JS
+      @vm.promise_rejection_hook = "lazyHook"
+
+      _(@vm.eval_code("seen")).must_equal ["g"]
+    end
+
+    it "reports rejectionhandled with jobs still queued" do
+      vm = Quickjs::VM.new(features: [::Quickjs::FEATURE_TIMEOUT], max_pending_rejections: 0)
+      vm.eval_code("globalThis.seen = []; globalThis.hook = (type) => seen.push(type);")
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("globalThis.p = Promise.reject(1); setTimeout(() => {}, 10000); 0")
+      vm.eval_code("void p.catch(() => {});")
+
+      _(vm.eval_code("seen")).must_equal ["unhandledrejection", "rejectionhandled"]
+    ensure
+      vm&.dispose!
+    end
+  end
+
   describe "ModuleLoader" do
     before do
       @vm = Quickjs::VM.new

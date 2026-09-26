@@ -115,6 +115,11 @@ typedef struct VMData
   RejectionList *notifying_rejections;
   // How many may stay pending past an entry that leaves jobs queued.
   uint32_t max_pending_rejections;
+  // JS function given the promise and reason as JS values; JS_UNDEFINED if unset.
+  JSValue j_rejection_hook;
+  JSValue j_rejection_hook_this;
+  // Promises that got a handler after they were reported, for the hook.
+  RejectionList late_handled_rejections;
   // Memoize (specifier, importer) → canonical so the user's loader Proc
   // runs at most once per distinct pair across the VM's lifetime. Without
   // this, QuickJS calls normalize on every import statement — including
@@ -196,7 +201,7 @@ typedef struct VMData
   VALUE owner_thread;
   // Number of GVL-release regions currently open on this VM (a subset of
   // evals_in_flight). Bridge-registration APIs (define_function,
-  // module_loader=, on_unhandled_rejection) refuse (ThreadError) while
+  // module_loader=, on_unhandled_rejection, promise_rejection_hook=) refuse (ThreadError) while
   // nonzero: the running JS was allowed to release the GVL because
   // can_eval_gvl_free held at eval start, and installing a bridge
   // mid-flight — e.g. from an on_log listener, whose callback runs with
@@ -264,6 +269,9 @@ static void vm_free(void *ptr)
       JS_FreeValue(data->context, data->j_blob_ctor);
 
     rejection_list_free(data->context, &data->pending_rejections);
+    rejection_list_free(data->context, &data->late_handled_rejections);
+    JS_FreeValue(data->context, data->j_rejection_hook);
+    JS_FreeValue(data->context, data->j_rejection_hook_this);
 
     vm_teardown_context(data->context, data->std_handlers_installed);
   }
@@ -346,6 +354,8 @@ static VALUE vm_alloc(VALUE r_self)
   data->module_loader = Qnil;
   data->on_unhandled_rejection = Qnil;
   data->notifying_rejections = NULL;
+  data->j_rejection_hook = JS_UNDEFINED;
+  data->j_rejection_hook_this = JS_UNDEFINED;
   data->module_resolution_cache = rb_hash_new();
   data->module_source_cache = rb_hash_new();
   data->preloaded_module_names = rb_hash_new();

@@ -59,6 +59,7 @@ module Quickjs
     # Normally a Quickjs::*Error built from the reason; a bridge raising while
     # the reason is read is handed through as itself.
     def on_unhandled_rejection: () { (Exception) -> void } -> nil
+    def promise_rejection_hook=: ((String | Symbol)?) -> (String | Symbol)?
 
     def on_log: () { (Log) -> void } -> nil
 

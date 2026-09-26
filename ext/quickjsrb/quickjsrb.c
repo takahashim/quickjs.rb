@@ -31,6 +31,7 @@ static void run_gvl_release_region(VMData *data, void *(*job_run)(void *), void 
 // Defined below, next to the stack-bounds query it depends on; enter_js_entry
 // above needs it.
 static void rebase_stack_limit(VMData *data);
+static void arm_eval_timer(VMData *data);
 
 JSValue to_js_value(JSContext *ctx, VALUE r_value);
 VALUE to_rb_value(JSContext *ctx, JSValue j_val);
@@ -1845,12 +1846,17 @@ static void rejection_list_split_oldest(JSContext *ctx, RejectionList *list, uin
 }
 
 // Also looks in the batch being notified, so a promise handled by then is skipped.
-static void pending_rejections_remove(VMData *data, JSValueConst promise)
+static bool pending_rejections_remove(VMData *data, JSValueConst promise)
 {
   if (JS_VALUE_GET_TAG(promise) != JS_TAG_OBJECT)
-    return;
-  if (!rejection_list_remove(data->context, &data->pending_rejections, promise))
-    rejection_list_remove(data->context, data->notifying_rejections, promise);
+    return false;
+  return rejection_list_remove(data->context, &data->pending_rejections, promise) ||
+         rejection_list_remove(data->context, data->notifying_rejections, promise);
+}
+
+static bool rejection_tracking_enabled(VMData *data)
+{
+  return !NIL_P(data->on_unhandled_rejection) || !JS_IsUndefined(data->j_rejection_hook);
 }
 
 // The reason is read here, inside the JS that rejected and on its clock, as
@@ -1861,18 +1867,24 @@ static void quickjsrb_promise_rejection_tracker(
     JS_BOOL is_handled, void *opaque)
 {
   VMData *data = JS_GetContextOpaque(ctx);
-  if (NIL_P(data->on_unhandled_rejection))
+  if (!rejection_tracking_enabled(data))
     return;
 
   if (is_handled)
   {
-    pending_rejections_remove(data, promise);
+    // Not pending, so it was reported already: HTML's rejectionhandled.
+    if (!pending_rejections_remove(data, promise) && !JS_IsUndefined(data->j_rejection_hook))
+      rejection_list_add(ctx, &data->late_handled_rejections, promise, Qnil, 0);
     return;
   }
 
   // Recorded before the reason is read, so a rejection the read makes comes
   // after it, and a handler the read attaches removes it.
   rejection_list_add(ctx, &data->pending_rejections, promise, Qnil, 0);
+  // The hook takes the reason as the JS value, and the block is not called
+  // while there is one.
+  if (!JS_IsUndefined(data->j_rejection_hook))
+    return;
 
   // A bridge error raised while reading the reason becomes the reason.
   int64_t error_handle = 0;
@@ -1910,6 +1922,43 @@ static JSValue quickjsrb_host_await(JSContext *ctx, JSValue promise)
   return ret;
 }
 
+static VALUE r_raise_js_exception(VALUE ctx)
+{
+  return raise_js_exception((JSContext *)ctx);
+}
+
+// A throw from the hook is dropped like a raise from the Ruby block, but
+// rendered first so an out-of-memory still poisons the VM.
+static void call_rejection_hook(VMData *data, const char *type, JSValueConst promise)
+{
+  JSContext *ctx = data->context;
+  arm_eval_timer(data);
+  // Held, as the hook may replace itself while it runs.
+  JSValue j_hook = JS_DupValue(ctx, data->j_rejection_hook);
+  JSValue j_this = JS_DupValue(ctx, data->j_rejection_hook_this);
+  JSValue j_type = JS_NewString(ctx, type);
+  JSValue ret = JS_EXCEPTION;
+  if (!JS_IsException(j_type))
+  {
+    JSValue j_reason = JS_PromiseResult(ctx, promise);
+    JSValueConst argv[3] = {j_type, promise, j_reason};
+    ret = JS_Call(ctx, j_hook, j_this, 3, argv);
+    JS_FreeValue(ctx, j_reason);
+  }
+  JS_FreeValue(ctx, j_type);
+  JS_FreeValue(ctx, j_hook);
+  JS_FreeValue(ctx, j_this);
+  if (!JS_IsException(ret))
+  {
+    JS_FreeValue(ctx, ret);
+    return;
+  }
+  VALUE r_errinfo = rb_errinfo();
+  int state;
+  rb_protect(r_raise_js_exception, (VALUE)ctx, &state);
+  rb_set_errinfo(r_errinfo);
+}
+
 static void notify_rejection_batch(VMData *data, RejectionList *batch)
 {
   data->notifying_rejections = batch;
@@ -1920,20 +1969,53 @@ static void notify_rejection_batch(VMData *data, RejectionList *batch)
       continue;
     if (entry.error_handle != 0)
       release_peeked_ruby_error(data, entry.error_handle, entry.reason);
+    JSValue promise = JS_DupValue(data->context, entry.promise);
 
-    struct rejection_call_args call_args = {data->on_unhandled_rejection, entry.reason};
-    int state;
-    rb_protect(r_rejection_call, (VALUE)&call_args, &state);
-    if (state)
-      rb_set_errinfo(Qnil);
+    // The hook, when there is one, takes the block's place.
+    if (!JS_IsUndefined(data->j_rejection_hook))
+    {
+      if (!data->oom_poisoned)
+        call_rejection_hook(data, "unhandledrejection", promise);
+    }
+    else if (!NIL_P(data->on_unhandled_rejection) && !NIL_P(entry.reason))
+    {
+      struct rejection_call_args call_args = {data->on_unhandled_rejection, entry.reason};
+      int state;
+      rb_protect(r_rejection_call, (VALUE)&call_args, &state);
+      if (state)
+        rb_set_errinfo(Qnil);
+    }
+    // Cleared only now, so a handler attached while this one was being
+    // reported is not a rejectionhandled; one for an earlier entry is.
+    rejection_list_remove(data->context, batch, promise);
+    JS_FreeValue(data->context, promise);
   }
   data->notifying_rejections = NULL;
+}
+
+// Not held for an empty queue, so ticking timers cannot hold them forever.
+// $! is kept as quickjsrb_notify_oldest_rejections keeps it.
+static void quickjsrb_notify_late_handled(VMData *data)
+{
+  if (data->late_handled_rejections.live == 0)
+    return;
+  VALUE r_errinfo = rb_errinfo();
+  if (!NIL_P(r_errinfo) && !rb_obj_is_kind_of(r_errinfo, rb_eException))
+    return;
+  rb_set_errinfo(Qnil);
+  RejectionList batch = data->late_handled_rejections;
+  memset(&data->late_handled_rejections, 0, sizeof(data->late_handled_rejections));
+  for (uint32_t i = 0; i < batch.count && !data->oom_poisoned && !JS_IsUndefined(data->j_rejection_hook); i++)
+    if (!JS_IsUndefined(batch.items[i].promise))
+      call_rejection_hook(data, "rejectionhandled", batch.items[i].promise);
+  rejection_list_free(data->context, &batch);
+  rb_set_errinfo(r_errinfo);
 }
 
 // The rest stay pending, ahead of any made while notifying.
 static void quickjsrb_notify_oldest_rejections(VMData *data, uint32_t n)
 {
-  if (NIL_P(data->on_unhandled_rejection) || n == 0)
+  if (!rejection_tracking_enabled(data) || n == 0)
     return;
   // $! is neither shown to the handler nor lost to its errors. A throw or a
   // kill in flight has no exception to put back, so its rejections wait.
@@ -1970,6 +2052,7 @@ static void quickjsrb_end_microtask_checkpoint(VMData *data)
     quickjsrb_notify_all_rejections(data, true);
   else if (live > data->max_pending_rejections)
     quickjsrb_notify_oldest_rejections(data, live - data->max_pending_rejections);
+  quickjsrb_notify_late_handled(data);
   // Give back what an emptied list still holds, rather than keep its peak.
   if (data->pending_rejections.live == 0)
     rejection_list_free(data->context, &data->pending_rejections);
@@ -2910,6 +2993,7 @@ static bool can_eval_gvl_free(VMData *data)
   return RHASH_SIZE(data->defined_functions) == 0
       && NIL_P(data->module_loader)
       && NIL_P(data->on_unhandled_rejection)
+      && JS_IsUndefined(data->j_rejection_hook)
       && !data->has_native_ruby_bridge;
 }
 
@@ -4364,51 +4448,10 @@ struct js_call_run
 
 static VALUE call_global_function_run(VALUE p);
 
-static VALUE call_global_function_body(VALUE p)
+// Resolves a VM#call name to the function and the `this` it is called on;
+// raises unless it names a function.
+static JSValue resolve_function_path(VMData *data, VALUE r_name, JSValue *j_this_out)
 {
-  struct js_entry_call *call = (struct js_entry_call *)p;
-  struct js_call_args args = {call->data->context, NULL, call->argc - 1};
-  if (args.nargs > 0)
-  {
-    args.j_args = xmalloc2(args.nargs, sizeof(JSValue));
-    for (int i = 0; i < args.nargs; i++)
-      args.j_args[i] = JS_UNDEFINED;
-  }
-  struct js_call_run run = {call, &args};
-  return rb_ensure(call_global_function_run, (VALUE)&run, js_call_args_release, (VALUE)&args);
-}
-
-static VALUE call_global_function_run(VALUE p)
-{
-  struct js_call_run *run = (struct js_call_run *)p;
-  struct js_entry_call *call = run->call;
-  struct js_call_args *args = run->args;
-  VALUE *argv = call->argv;
-  VMData *data = call->data;
-  VALUE r_name = argv[0];
-
-  // Converted first, under a clock of its own. Mostly this is Ruby work —
-  // inspect on the caller's objects, allocation, a GVL yield to another thread
-  // — and none of it is the guest's to pay for, which is why the arm above the
-  // resolution below starts the budget over. But a conversion can still run JS:
-  // a File argument calls the proxy creator, which polls the interrupt handler
-  // on the way, so without an arm here it ran on whatever clock the previous
-  // entry left — a lapsed one interrupts the conversion at random and hands the
-  // function a JS_EXCEPTION for an argument. Two arms, but not the two budgets
-  // the previous commit had: no guest-written JS runs between them unless the
-  // guest has replaced Proxy, and then it is bounded rather than unbounded.
-  // (A Bignum used to call Number() here too; it converts without asking the
-  // guest for anything now.)
-  arm_eval_timer(data);
-  for (int i = 0; i < args->nargs; i++)
-  {
-    args->j_args[i] = to_js_value(data->context, argv[i + 1]);
-    // An argument that could not be built is not handed to the call as the
-    // sentinel. The ensure that owns j_args releases what was built already.
-    if (JS_IsException(args->j_args[i]))
-      raise_js_exception(data->context); // raises
-  }
-
   JSValue j_this = JS_UNDEFINED;
   JSValue j_func;
 
@@ -4480,7 +4523,7 @@ static VALUE call_global_function_run(VALUE p)
     // JS_Eval accesses both global object properties and lexical (const/let) bindings
     JSValue j_cur = JS_Eval(data->context, first_seg, strlen(first_seg), vmInternalFilename, JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(j_cur))
-      return to_rb_value(data->context, j_cur); // raises
+      to_rb_value(data->context, j_cur); // raises
 
     for (long i = 1; i < path_len; i++)
     {
@@ -4499,7 +4542,7 @@ static VALUE call_global_function_run(VALUE p)
       {
         JS_FreeValue(data->context, j_cur);
         JS_FreeValue(data->context, j_this);
-        return to_rb_value(data->context, j_next); // raises
+        to_rb_value(data->context, j_next); // raises
       }
 
       JS_FreeValue(data->context, j_this);
@@ -4516,8 +4559,58 @@ static VALUE call_global_function_run(VALUE p)
     JS_FreeValue(data->context, j_this);
     VALUE r_error_message = rb_str_new2("given path is not a function");
     rb_exc_raise(rb_funcall(QUICKJSRB_ERROR_FOR(QUICKJSRB_ROOT_RUNTIME_ERROR), rb_intern("new"), 2, r_error_message, Qnil));
-    return Qnil;
   }
+  *j_this_out = j_this;
+  return j_func;
+}
+
+static VALUE call_global_function_body(VALUE p)
+{
+  struct js_entry_call *call = (struct js_entry_call *)p;
+  struct js_call_args args = {call->data->context, NULL, call->argc - 1};
+  if (args.nargs > 0)
+  {
+    args.j_args = xmalloc2(args.nargs, sizeof(JSValue));
+    for (int i = 0; i < args.nargs; i++)
+      args.j_args[i] = JS_UNDEFINED;
+  }
+  struct js_call_run run = {call, &args};
+  return rb_ensure(call_global_function_run, (VALUE)&run, js_call_args_release, (VALUE)&args);
+}
+
+static VALUE call_global_function_run(VALUE p)
+{
+  struct js_call_run *run = (struct js_call_run *)p;
+  struct js_entry_call *call = run->call;
+  struct js_call_args *args = run->args;
+  VALUE *argv = call->argv;
+  VMData *data = call->data;
+  VALUE r_name = argv[0];
+
+  // Converted first, under a clock of its own. Mostly this is Ruby work —
+  // inspect on the caller's objects, allocation, a GVL yield to another thread
+  // — and none of it is the guest's to pay for, which is why the arm above the
+  // resolution below starts the budget over. But a conversion can still run JS:
+  // a File argument calls the proxy creator, which polls the interrupt handler
+  // on the way, so without an arm here it ran on whatever clock the previous
+  // entry left — a lapsed one interrupts the conversion at random and hands the
+  // function a JS_EXCEPTION for an argument. Two arms, but not the two budgets
+  // the previous commit had: no guest-written JS runs between them unless the
+  // guest has replaced Proxy, and then it is bounded rather than unbounded.
+  // (A Bignum used to call Number() here too; it converts without asking the
+  // guest for anything now.)
+  arm_eval_timer(data);
+  for (int i = 0; i < args->nargs; i++)
+  {
+    args->j_args[i] = to_js_value(data->context, argv[i + 1]);
+    // An argument that could not be built is not handed to the call as the
+    // sentinel. The ensure that owns j_args releases what was built already.
+    if (JS_IsException(args->j_args[i]))
+      raise_js_exception(data->context); // raises
+  }
+
+  JSValue j_this;
+  JSValue j_func = resolve_function_path(data, r_name, &j_this);
 
   JSValue j_result = JS_Call(data->context, j_func, j_this, args->nargs, (JSValueConst *)args->j_args);
 
@@ -4590,6 +4683,51 @@ static VALUE vm_m_on_unhandled_rejection(VALUE r_self)
   check_no_gvl_release_in_flight(data);
   data->on_unhandled_rejection = rb_block_proc();
   return Qnil;
+}
+
+struct rejection_hook_set
+{
+  VMData *data;
+  VALUE r_name;
+};
+
+// Resolved once, as VM#call resolves a name, so the page cannot swap the hook
+// out afterwards.
+static VALUE rejection_hook_set_body(VALUE p)
+{
+  struct rejection_hook_set *set = (struct rejection_hook_set *)p;
+  VMData *data = set->data;
+  JSContext *ctx = data->context;
+
+  JSValue j_hook = JS_UNDEFINED;
+  JSValue j_this = JS_UNDEFINED;
+  if (!NIL_P(set->r_name))
+    j_hook = resolve_function_path(data, set->r_name, &j_this);
+
+  JS_FreeValue(ctx, data->j_rejection_hook);
+  JS_FreeValue(ctx, data->j_rejection_hook_this);
+  data->j_rejection_hook = j_hook;
+  data->j_rejection_hook_this = j_this;
+  if (JS_IsUndefined(j_hook))
+  {
+    rejection_list_free(ctx, &data->late_handled_rejections);
+    if (NIL_P(data->on_unhandled_rejection))
+      rejection_list_free(ctx, &data->pending_rejections);
+  }
+  return set->r_name;
+}
+
+static VALUE vm_m_set_promise_rejection_hook(VALUE r_self, VALUE r_name)
+{
+  VMData *data;
+  TypedData_Get_Struct(r_self, VMData, &vm_type, data);
+
+  check_disposed(data);
+  check_vm_poisoned(data);
+  check_no_gvl_release_in_flight(data);
+
+  struct rejection_hook_set set = {data, r_name};
+  return run_held_js_checkpoint_entry(data, rejection_hook_set_body, (VALUE)&set);
 }
 
 static VALUE import_body(VALUE p)
@@ -4749,6 +4887,7 @@ RUBY_FUNC_EXPORTED void Init_quickjsrb(void)
   rb_define_method(r_class_vm, "module_loader", vm_m_get_module_loader, 0);
   rb_define_method(r_class_vm, "module_loader=", vm_m_set_module_loader, 1);
   rb_define_method(r_class_vm, "on_unhandled_rejection", vm_m_on_unhandled_rejection, 0);
+  rb_define_method(r_class_vm, "promise_rejection_hook=", vm_m_set_promise_rejection_hook, 1);
   rb_define_method(r_class_vm, "on_log", vm_m_on_log, 0);
   rb_define_method(r_class_vm, "memory_usage", vm_m_memoryUsage, 0);
   rb_define_method(r_class_vm, "gc!", vm_m_runGC, 0);
@@ -4826,7 +4965,7 @@ static VALUE vm_m_drainJobs(VALUE r_self)
 
   // Rejections can be pending with no job queued.
   if (!JS_IsJobPending(JS_GetRuntime(data->context)) &&
-      data->pending_rejections.live == 0)
+      data->pending_rejections.live == 0 && data->late_handled_rejections.live == 0)
     return INT2NUM(0);
 
   return run_held_js_checkpoint_entry(data, drain_jobs_body, (VALUE)data);
@@ -4879,6 +5018,7 @@ static void *vm_dispose_no_gvl(void *p)
 static VALUE dispose_notify_body(VALUE p)
 {
   quickjsrb_notify_all_rejections((VMData *)p, false);
+  quickjsrb_notify_late_handled((VMData *)p);
   return Qnil;
 }
 
@@ -4901,9 +5041,14 @@ static VALUE vm_m_dispose(VALUE r_self)
 
   // Jobs still queued will never run, so what is pending is unhandled. Counted
   // as an entry, so the handler cannot dispose! under it.
-  if (data->pending_rejections.live > 0 && !data->oom_poisoned)
+  if ((data->pending_rejections.live > 0 || data->late_handled_rejections.live > 0) && !data->oom_poisoned)
     run_held_js_entry(data, dispose_notify_body, (VALUE)data);
   rejection_list_free(data->context, &data->pending_rejections);
+  rejection_list_free(data->context, &data->late_handled_rejections);
+  JS_FreeValue(data->context, data->j_rejection_hook);
+  JS_FreeValue(data->context, data->j_rejection_hook_this);
+  data->j_rejection_hook = JS_UNDEFINED;
+  data->j_rejection_hook_this = JS_UNDEFINED;
 
   if (!JS_IsUndefined(data->j_file_proxy_creator))
   {
