@@ -330,6 +330,25 @@ As in HTML, a handler attached later in the same microtask checkpoint counts: a 
 
 With `FEATURE_TIMEOUT`, a pending `setTimeout` counts as a queued job, so a report can be deferred until the timers drain, and a handler attached inside a timer callback still counts as attached in the same checkpoint ([#145](https://github.com/hmsk/quickjs.rb/issues/145)). Hosts that need reports not to wait for timers can use `max_pending_rejections: 0`.
 
+#### `Quickjs::VM#promise_rejection_hook=`: 🪝 Hand rejections to a JS function, values intact
+
+The block above gets a Ruby copy of the reason. When the JS side needs the rejection itself — to dispatch an HTML `unhandledrejection` / `rejectionhandled` event with the real `promise` and `reason`, say — register a JS function instead. While a hook is registered, it takes the place of the `on_unhandled_rejection` block, which is not called:
+
+```rb
+vm = Quickjs::VM.new
+vm.eval_code(<<~JS)
+  globalThis.onRejection = (type, promise, reason) => { /* ... */ };
+JS
+vm.promise_rejection_hook = "onRejection"
+```
+
+The name is resolved as `VM#call` resolves one (`"host.onRejection"` works, and keeps `host` as `this`), once: the function is kept, so reassigning `onRejection` later has no effect; assign `nil` to remove the hook and go back to the block. The hook is called as `hook(type, promise, reason)`, with the promise and reason passed as the JS values themselves:
+
+- `"unhandledrejection"` — at the end of the checkpoint, when `on_unhandled_rejection` would have been called.
+- `"rejectionhandled"` — when a handler is attached to a promise that was already reported, at the end of the checkpoint where that happens, even with timers still queued. A handler attached while the promise is being reported (from the hook itself) does not count, as in HTML. The hook may also receive this for a promise it was never told about — one rejected before the hook was registered, or one the host awaited (`vm.call` raising its rejection) — so keep the promises you were told about (a `WeakSet`) and ignore the others.
+
+A throw from the hook is swallowed and the remaining notifications still go out; an out-of-memory poisons the VM as anywhere else, and the hook is not called after it. Each call gets its own `timeout_msec`. Jobs the hook queues run at the next drain, like any other. Registering a hook keeps `eval_code` on the GVL-held path, as the other bridges do.
+
 #### `Quickjs::VM#define_function`: 💎 Define a global function for JS by Ruby
 
 ```rb
@@ -580,7 +599,7 @@ Useful when porting JS that assumed V8's implicit-drain semantics — V8 (and th
 
 #### Threads and parallelism
 
-`eval_code` and `Runnable#run` release Ruby's GVL while JS runs, as long as no JS→Ruby bridge is registered on the VM (no `define_function`, `module_loader`, `on_unhandled_rejection`, and none of `FEATURE_TIMEOUT` / `POLYFILL_FILE` / `POLYFILL_CRYPTO` — `console.log` is fine). Separate VMs on separate Ruby threads then evaluate genuinely in parallel on multi-core hosts — including the compile-once-run-everywhere pattern, where per-thread VMs execute the same `Runnable` concurrently. When a bridge is registered, the GVL stays held for that VM's evals and they serialize as usual.
+`eval_code` and `Runnable#run` release Ruby's GVL while JS runs, as long as no JS→Ruby bridge is registered on the VM (no `define_function`, `module_loader`, `on_unhandled_rejection`, `promise_rejection_hook=`, and none of `FEATURE_TIMEOUT` / `POLYFILL_FILE` / `POLYFILL_CRYPTO` — `console.log` is fine). Separate VMs on separate Ruby threads then evaluate genuinely in parallel on multi-core hosts — including the compile-once-run-everywhere pattern, where per-thread VMs execute the same `Runnable` concurrently. When a bridge is registered, the GVL stays held for that VM's evals and they serialize as usual.
 
 `compile` releases the GVL for the parse regardless of what is registered on the VM — parsing to bytecode runs no JS, so no bridge can be reached and the no-bridge rule above doesn't apply to it. Serializing the result back into a Ruby String stays on the GVL, which costs about 5% of the available speedup. So a dedicated compile VM, on its own thread, parses in parallel with everything else running in the process. `compile_module` (and therefore `Quickjs.register_module` / `Quickjs.compile_module`) does not release the GVL.
 
@@ -597,7 +616,7 @@ The rules for sharing VMs across threads:
 
   It is refusal, not serialization: nothing queues and waits. Every method that touches the runtime is covered, `gc!` and `memory_usage` included. Handing a VM off between threads (e.g. constructing it on a warmer thread and using it on another) is still fine, since ownership is only held for the duration of a call. So is a bridge re-entering its own VM — a `define_function` proc or `on_log` listener calling `eval_code` is the same thread, and is allowed.
 - **The stack budget follows the evaluating thread.** QuickJS records the creating thread's stack bounds once, which used to make a handoff trip a false stack-overflow error on trivial code. The limit is now re-based on each outermost entry against the stack of the thread about to run JS, so where the VM was built no longer matters. `max_stack_size` is a ceiling rather than a guarantee: a Ruby thread's machine stack is a fraction of the main thread's, so the budget in force is whatever that thread actually has, less a margin to report the overflow with.
-- **Register bridges before evaluating.** `define_function`, `module_loader=`, and `on_unhandled_rejection` raise `ThreadError` while a GVL-released eval is in flight (e.g. from inside an `on_log` listener) — the running JS was allowed to release the GVL precisely because no bridge existed when it started.
+- **Register bridges before evaluating.** `define_function`, `module_loader=`, `on_unhandled_rejection`, and `promise_rejection_hook=` raise `ThreadError` while a GVL-released eval is in flight (e.g. from inside an `on_log` listener) — the running JS was allowed to release the GVL precisely because no bridge existed when it started.
 - **`MODULE_OS` caveat:** `os.signal` and `os.ttySetRaw` mutate process-wide state inside quickjs-libc, so don't call those two from VMs running concurrently on different threads. The common APIs (`os.sleep`, `os.setTimeout`, file I/O) only touch per-runtime state and are safe.
 
 ### Value Conversion
