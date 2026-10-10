@@ -118,6 +118,11 @@ typedef struct VMData
   // JS function given the promise and reason as JS values; JS_UNDEFINED if unset.
   JSValue j_rejection_hook;
   JSValue j_rejection_hook_this;
+  // A WeakSet of the promises this hook was told about, with its own add and
+  // delete, so rejectionhandled reaches only the hook that saw the report.
+  JSValue j_reported_rejections;
+  JSValue j_reported_add;
+  JSValue j_reported_delete;
   // Promises that got a handler after they were reported, for the hook.
   RejectionList late_handled_rejections;
   // Memoize (specifier, importer) → canonical so the user's loader Proc
@@ -272,6 +277,9 @@ static void vm_free(void *ptr)
     rejection_list_free(data->context, &data->late_handled_rejections);
     JS_FreeValue(data->context, data->j_rejection_hook);
     JS_FreeValue(data->context, data->j_rejection_hook_this);
+    JS_FreeValue(data->context, data->j_reported_rejections);
+    JS_FreeValue(data->context, data->j_reported_add);
+    JS_FreeValue(data->context, data->j_reported_delete);
 
     vm_teardown_context(data->context, data->std_handlers_installed);
   }
@@ -356,6 +364,9 @@ static inline VALUE vm_alloc(VALUE r_self)
   data->notifying_rejections = NULL;
   data->j_rejection_hook = JS_UNDEFINED;
   data->j_rejection_hook_this = JS_UNDEFINED;
+  data->j_reported_rejections = JS_UNDEFINED;
+  data->j_reported_add = JS_UNDEFINED;
+  data->j_reported_delete = JS_UNDEFINED;
   data->module_resolution_cache = rb_hash_new();
   data->module_source_cache = rb_hash_new();
   data->preloaded_module_names = rb_hash_new();

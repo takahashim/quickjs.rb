@@ -3799,6 +3799,20 @@ end
       _(vm.disposed?).must_equal false
       _(vm.eval_code("1 + 1")).must_equal 2
     end
+
+    it "keeps calling the block after it runs out of memory" do
+      vm = Quickjs::VM.new(memory_limit: 1024 * 1024 * 8)
+      captured = []
+      vm.on_unhandled_rejection do |err|
+        captured << err
+        vm.eval_code("const a = []; for (;;) a.push(new Array(1e5).fill(0));") rescue nil
+      end
+      vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
+
+      _(captured.size).must_equal 2
+    ensure
+      vm&.dispose!
+    end
   end
 
   describe "promise_rejection_hook=" do
@@ -3924,6 +3938,8 @@ end
       _(reported).must_be_empty
       vm.dispose!
       _(reported).must_equal [["unhandledrejection", "x"]]
+    ensure
+      vm&.dispose!
     end
 
     it "refuses a name that does not hold a function" do
@@ -3952,34 +3968,46 @@ end
 
       _(vm.memory_poisoned?).must_equal true
       _ { vm.promise_rejection_hook = nil }.must_raise Quickjs::RuntimeError
+    ensure
+      vm&.dispose!
     end
 
-    it "gives each call its own clock" do
-      vm = Quickjs::VM.new(timeout_msec: 100)
+    # One clock per call would let the guest multiply the budget by rejecting
+    # more promises: five calls here would take half a second.
+    it "gives all the reports of a checkpoint one clock" do
+      vm = Quickjs::VM.new(timeout_msec: 150)
       vm.eval_code(<<~JS)
         globalThis.seen = [];
         globalThis.hook = (type, promise, reason) => {
+          const t = Date.now(); while (Date.now() - t < 100);
           seen.push(reason);
-          if (reason === 'a') { const t = Date.now(); while (Date.now() - t < 150); }
         };
       JS
       vm.promise_rejection_hook = "hook"
-      vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
 
-      _(vm.eval_code("seen")).must_equal ["a", "b"]
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      vm.eval_code("for (let i = 0; i < 5; i++) void Promise.reject(i);")
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      _(vm.eval_code("seen.length")).must_be :<, 5
+      _(elapsed).must_be :<, 0.45
+    ensure
+      vm&.dispose!
     end
 
-    it "keeps calling the Ruby block after an out-of-memory" do
-      @vm.promise_rejection_hook = nil
-      vm = Quickjs::VM.new(memory_limit: 1024 * 1024 * 8)
-      captured = []
-      vm.on_unhandled_rejection do |err|
-        captured << err
-        vm.eval_code("const a = []; for (;;) a.push(new Array(1e5).fill(0));") rescue nil
-      end
-      vm.eval_code("void Promise.reject('a'); void Promise.reject('b');")
+    it "starts the reports on a clock of their own, not the entry's" do
+      vm = Quickjs::VM.new(timeout_msec: 200)
+      vm.eval_code(<<~JS)
+        globalThis.seen = [];
+        globalThis.spin = (ms) => { const t = Date.now(); while (Date.now() - t < ms); };
+        globalThis.hook = (type, promise, reason) => { spin(100); seen.push(reason); };
+      JS
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("spin(150); void Promise.reject('late');")
 
-      _(captured.size).must_equal 2
+      _(vm.eval_code("seen")).must_equal ["late"]
+    ensure
+      vm&.dispose!
     end
 
     it "does not show $! to bridges called for rejectionhandled" do
@@ -4014,6 +4042,94 @@ end
       _(vm.eval_code("seen")).must_equal ["unhandledrejection", "rejectionhandled"]
     ensure
       vm&.dispose!
+    end
+
+    it "hands the block what was recorded while the hook was registered" do
+      captured = []
+      @vm.on_unhandled_rejection { |err| captured << err }
+      @vm.define_function("off") { @vm.promise_rejection_hook = nil }
+      @vm.eval_code("globalThis.hook = (t, p, r) => { seen.push(r.message); off(); }; 0")
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("void Promise.reject(new Error('a')); void Promise.reject(new RangeError('b'));")
+
+      _(@vm.eval_code("seen")).must_equal ["a"]
+      _(captured.map { |e| [e.class, e.message] }).must_equal [[Quickjs::RangeError, "b"]]
+    end
+
+    it "hands the block a rejection carried past the call that cleared the hook" do
+      vm = Quickjs::VM.new(features: [::Quickjs::FEATURE_TIMEOUT])
+      captured = []
+      vm.on_unhandled_rejection { |err| captured << err.message }
+      vm.eval_code("globalThis.seen = []; globalThis.hook = (t, p, r) => seen.push(r.message);")
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("void Promise.reject(new Error('carried')); setTimeout(() => {}, 0); 0")
+      vm.promise_rejection_hook = nil
+      vm.drain_jobs!
+
+      _(vm.eval_code("seen")).must_equal []
+      _(captured).must_equal ["carried"]
+    ensure
+      vm&.dispose!
+    end
+
+    it "drops what is pending when cleared with no block to take over" do
+      vm = Quickjs::VM.new(features: [::Quickjs::FEATURE_TIMEOUT])
+      vm.eval_code("globalThis.seen = []; globalThis.hook = (t, p, r) => seen.push(r);")
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("void Promise.reject('carried'); setTimeout(() => {}, 0); 0")
+      vm.promise_rejection_hook = nil
+      vm.drain_jobs!
+      vm.promise_rejection_hook = "hook"
+      vm.eval_code("1")
+
+      _(vm.eval_code("seen")).must_equal []
+    ensure
+      vm&.dispose!
+    end
+
+    it "does not pin a bridged exception it reported" do
+      marker = Class.new(StandardError)
+      @vm.define_function("probe") { raise marker, "boom" }
+      @vm.eval_code("globalThis.hook = () => {}; 0")
+      @vm.promise_rejection_hook = "hook"
+      attempt = proc { @vm.eval_code("void (async () => { await probe() })(); 0") }
+
+      3.times(&attempt)
+      GC.start(full_mark: true, immediate_sweep: true)
+      before = ObjectSpace.each_object(marker).count
+      200.times(&attempt)
+      GC.start(full_mark: true, immediate_sweep: true)
+
+      _(ObjectSpace.each_object(marker).count - before).must_equal 0
+    end
+
+    it "reports rejectionhandled only for what this hook was told about" do
+      @vm.promise_rejection_hook = nil
+      @vm.on_unhandled_rejection { |_err| }
+      @vm.eval_code("globalThis.toBlock = Promise.reject(1); 0")
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("globalThis.toFirst = Promise.reject(2); 0")
+      @vm.eval_code("globalThis.second = (type, promise, reason) => seen.push({type: 'second:' + type, reason}); 0")
+      @vm.promise_rejection_hook = "second"
+      @vm.eval_code("void toBlock.catch(() => {}); void toFirst.catch(() => {});")
+      @vm.drain_jobs!
+      @vm.eval_code("globalThis.toSecond = Promise.reject(3); 0")
+      @vm.eval_code("void toSecond.catch(() => {});")
+      @vm.drain_jobs!
+
+      _(@vm.eval_code("seen.map(s => s.type + ':' + s.reason)")).must_equal [
+        "unhandledrejection:2", "second:unhandledrejection:3", "second:rejectionhandled:3"
+      ]
+    end
+
+    it "tells on_log about a throw from the hook" do
+      logs = []
+      @vm.on_log { |log| logs << log.to_s }
+      @vm.eval_code("globalThis.hook = () => { throw new Error('hook broke'); }; 0")
+      @vm.promise_rejection_hook = "hook"
+      @vm.eval_code("void Promise.reject(1);")
+
+      _(logs.grep(/Uncaught Error: hook broke/).size).must_equal 1
     end
   end
 

@@ -342,12 +342,12 @@ JS
 vm.promise_rejection_hook = "onRejection"
 ```
 
-The name is resolved as `VM#call` resolves one (`"host.onRejection"` works, and keeps `host` as `this`), once: the function is kept, so reassigning `onRejection` later has no effect; assign `nil` to remove the hook and go back to the block. The hook is called as `hook(type, promise, reason)`, with the promise and reason passed as the JS values themselves:
+The name is resolved as `VM#call` resolves one (`"host.onRejection"` works, and keeps `host` as `this`), once: the function is kept, so reassigning `onRejection` later has no effect; assign `nil` to remove the hook and go back to the block, which then also gets the rejections still pending (with no block registered, they are dropped). The hook is called as `hook(type, promise, reason)`, with the promise and reason passed as the JS values themselves:
 
 - `"unhandledrejection"` — at the end of the checkpoint, when `on_unhandled_rejection` would have been called.
-- `"rejectionhandled"` — when a handler is attached to a promise that was already reported, at the end of the checkpoint where that happens, even with timers still queued. A handler attached while the promise is being reported (from the hook itself) does not count, as in HTML. The hook may also receive this for a promise it was never told about — one rejected before the hook was registered, or one the host awaited (`vm.call` raising its rejection) — so keep the promises you were told about (a `WeakSet`) and ignore the others.
+- `"rejectionhandled"` — when a handler is attached to a promise that was already reported, at the end of the checkpoint where that happens, even with timers still queued. A handler attached while the promise is being reported (from the hook itself) does not count, as in HTML. Only promises reported to this hook count: not one reported to the block or to an earlier hook, nor one the host awaited (`vm.call` raising its rejection).
 
-A throw from the hook is swallowed and the remaining notifications still go out; an out-of-memory poisons the VM as anywhere else, and the hook is not called after it. Each call gets its own `timeout_msec`. Jobs the hook queues run at the next drain, like any other. Registering a hook keeps `eval_code` on the GVL-held path, as the other bridges do.
+A throw from the hook goes to `on_log` as an uncaught error and is otherwise swallowed, and the remaining notifications still go out; an out-of-memory poisons the VM as anywhere else, and the hook is not called after it. All the calls one checkpoint makes share a single `timeout_msec`, started when the reports begin rather than carried over from the evaluation; a hook interrupted by it is treated as one that threw. Jobs the hook queues run at the next drain, like any other. Registering a hook keeps `eval_code` on the GVL-held path, as the other bridges do.
 
 #### `Quickjs::VM#define_function`: 💎 Define a global function for JS by Ruby
 
